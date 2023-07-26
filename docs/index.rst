@@ -1,35 +1,27 @@
-.. coremltools API Reference documentation master file, created by
-   sphinx-quickstart on Thu Apr 22 13:19:37 2021.
+.. Core ML Tools documentation master file, created by
+   sphinx-quickstart on Tue Jun 11 11:28:28 2019.
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-coremltools API
-=====================
-
-.. image:: logo.png
-   :alt: Core ML Tools logo
-
-This document is the API Reference for coremltools. For guides, installation instructions, and examples, see `Guides <https://coremltools.readme.io/docs>`_.
+Welcome to Core ML Tools's documentation!
+=========================================
 
 .. toctree::
-   :maxdepth: 1
-   :caption: API Contents
+   :maxdepth: 2
+   :caption: Contents:
 
-   source/coremltools.converters.rst
-   source/coremltools.models.rst
-   source/coremltools.converters.mil.rst
-   source/coremltools.converters.mil.input_types.rst
-   source/coremltools.converters.mil.mil.ops.defs.rst
-   source/coremltools.converters.mil.mil.passes.defs.rst
-   source/coremltools.optimize.rst
+   coremltools.converters
+   coremltools.converters.mil
+   coremltools.converters.mil.input_types
+   coremltools.converters.mil.mil.ops.defs
+   coremltools.converters.mil.mil.passes.defs
+   coremltools.models
+   coremltools.optimize
+
+Indices and tables
+==================
 
 * :ref:`genindex`
 * :ref:`modindex`
+* :ref:`search`
 
-.. toctree::
-   :maxdepth: 1
-   :caption: Resources
-
-   Guides and examples <https://coremltools.readme.io/docs>
-   Core ML Format Specification <https://apple.github.io/coremltools/mlmodel/index.html>
-   GitHub <https://github.com/apple/coremltools>
