@@ -1828,10 +1828,17 @@ def group_norm(context, node):
     bias = inputs[3]
     eps = inputs[4]
     n,c = x.shape[0],x.shape[1] # at minimum (N, C) required
-    input_shape = [*x.shape] # n, c, *
     num_groups = builtins.min(num_groups,c)
     new_shape = [n, num_groups, c//num_groups]
-    new_shape += [*x.shape[2:]] # adds remaining dims
+    # optimization for non symbolic shapes. This get rids of 3 mil ops that required on dynamic shapes
+    if not any_symbolic(x.shape[2:]):
+        new_shape += [*x.shape[2:]] # adds remaining dims
+        input_shape = [*x.shape] # n, c, *
+    else:
+        input_shape = mb.shape(x=x)
+        input_shape_sliced = mb.slice_by_size(x=input_shape, begin=[2], size=[-1]) # x_shape[2:]
+        new_shape = mb.concat(values=[new_shape, input_shape_sliced], axis=0)
+
     num_extra_axes = len(x.shape[2:])
     axes_ = [int(i) for i in range(2, 2 + num_extra_axes + 1)]
     weight_shape, bias_shape = [1,c], [1,c]
@@ -5439,21 +5446,32 @@ def baddbmm(context, node):
     inputs = _get_inputs(context, node, expected=5)
     bias, batch1, batch2, beta, alpha = inputs
 
-    if beta.val != 1.0:
-        # Apply scaling factor beta to the bias.
-        bias = mb.mul(x=beta, y=bias, name=bias.name + "_scaled")
-        context.add(bias)
-
     if alpha.val != 1.0:
         # Apply scaling factor alpha to the input.
         batch1 = mb.mul(x=alpha, y=batch1, name=batch1.name + "_scaled")
         context.add(batch1)
 
     bmm_node = mb.matmul(x=batch1, y=batch2, name=node.name + "_bmm")
-    context.add(bmm_node)
 
-    baddbmm_node = mb.add(x=bias, y=bmm_node, name=node.name)
-    context.add(baddbmm_node)
+    if beta.val != 0.0 or bias.shape != bmm_node.shape:
+        context.add(bmm_node)
+        if beta.val != 1.0:
+            # Torch supports integers, so convert to float before
+            if beta.dtype != bias.dtype:
+                logger.warning(
+                    f"Casting the `beta`(value={beta.val}) argument of `baddbmm` op {node.name} "
+                    f"from {beta.dtype} to {bias.dtype} dtype")
+                beta = mb.cast(x=beta, dtype=TYPE_TO_DTYPE_STRING[bias.dtype])
+            # Apply scaling factor beta to the bias.
+            bias = mb.mul(x=beta, y=bias, name=bias.name + "_scaled")
+            context.add(bias)
+
+        baddbmm_node = mb.add(x=bias, y=bmm_node, name=node.name)
+        context.add(baddbmm_node)    
+    else:
+        bmm_node.name = node.name
+        context.add(bmm_node)
+
 
 
 @register_torch_op
