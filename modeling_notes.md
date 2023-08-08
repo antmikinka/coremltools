@@ -1,0 +1,2 @@
+August 8, 2023
+Makes me wonder with the repos: hft2ane and more-ane-transformers, if what is the problem with larger models is that they're being converted. I wonder what if the models were built in a more native language, would the system handle it better? I understand M1 not a lot of space as seen from (more-ane-transformers, model_notes.md). Or perhaps building in a more native language such as Swift with CreateML, CreateML Components, and CoreML M1/M architecture may react better to 2B+ params models?
