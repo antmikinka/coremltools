@@ -276,10 +276,7 @@ def spatial_dimensions_out_shape(
         # * `effective_ks` (effective kernel size, determined from kernel size + dilations) cannot be symbolic
         # * strides cannot be symbolic
         if is_symbolic(input_shape[r]):
-            if not is_symbolic(pad[r]) and pad[r] - effective_ks[r] == -1 and strides[r] == 1:
-                out_shape.append(input_shape[r])
-            else:
-                out_shape.append(get_new_symbol())
+            out_shape.append(get_new_symbol())
         else:
             out_dim = 0
             if not ceil_mode:
@@ -294,7 +291,7 @@ def spatial_dimensions_out_shape(
     return out_shape
 
 
-def parse_einsum_equation(equation: str) -> List[List[str]]:
+def parse_einsum_equation(equation: str) -> Tuple[List[str]]:
     """
     Args
         equation : str
@@ -341,7 +338,7 @@ def parse_einsum_equation(equation: str) -> List[List[str]]:
         index, vec = _update_vec(inout_str, map_char_to_int, index)
         in_outs_vec.append(vec)
 
-    return in_outs_vec
+    return tuple(in_outs_vec)
 
 def compute_gather(params, indices, axis, batch_dims):
     """
@@ -459,6 +456,13 @@ def solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask
         """
         We first deal with those cases, where the output size is a deterministic number, even if the input dimension
         is unknown (i.e. symbolic)
+        - No begin_mask and no end_mask:
+          - begin == end. output shape = 0.
+          - begin == end - 1, stride > 0. output shape = 1
+          - begin == end + 1, stride < 0. output shape = 1
+        - begin_mask is false and end_mask is true:
+          - begin == -1, stride > 0. output shape = 1
+          - begin == 0, stride < 0. output shape = 1
         """
         if (
             not begin_mask[idx]
@@ -466,9 +470,7 @@ def solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask
             and begin[idx] is not None
             and end[idx] is not None
         ):
-            # in this case the slice is from "begin" to "end", where both these boundary points are known
-            # we can find the size of the slice in this case, unless one of them is positive and other is negative
-            # as in that case, we would need to know the size of the full input dimension
+            out_shape = None
             if begin[idx] >= 0 and end[idx] >= 0 and stride[idx] > 0:
                 if end[idx] < begin[idx]:
                     raise ValueError(
@@ -477,12 +479,10 @@ def solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask
                             idx, begin[idx], end[idx], stride[idx]
                         )
                     )
-                ret_shape.append(
-                    np.arange(end[idx] - begin[idx])[
-                        slice(0, end[idx] - begin[idx], stride[idx])
-                    ].size
-                )
-                continue
+                out_shape = np.arange(end[idx] - begin[idx])[
+                    slice(0, end[idx] - begin[idx], stride[idx])
+                ].size
+
             if begin[idx] < 0 and end[idx] < 0 and stride[idx] < 0:
                 if begin[idx] < end[idx]:
                     raise ValueError(
@@ -491,41 +491,17 @@ def solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask
                             idx, begin[idx], end[idx], stride[idx]
                         )
                     )
-                ret_shape.append(
-                    np.arange(begin[idx] - end[idx])[
-                        slice(-1, end[idx] - begin[idx] - 1, stride[idx])
-                    ].size
-                )
-                continue
+                out_shape = np.arange(begin[idx] - end[idx])[
+                    slice(-1, end[idx] - begin[idx] - 1, stride[idx])
+                ].size
 
-        if begin_mask[idx] and not end_mask[idx] and end[idx] is not None:
-            # in this case we know that the slice is [0, end] or [-1, end], depending on the sign of stride,
-            #  and the value of end is known
-            if end[idx] > 0 and stride[idx] > 0:
-                ret_shape.append(
-                    np.arange(end[idx])[slice(None, end[idx], stride[idx])].size
-                )
-                continue
-            if end[idx] < 0 and stride[idx] < 0:
-                ret_shape.append(
-                    np.arange(abs(end[idx]))[slice(None, end[idx], stride[idx])].size
-                )
+            if out_shape in (0, 1):
+                ret_shape.append(out_shape)
                 continue
 
         if not begin_mask[idx] and end_mask[idx] and begin[idx] is not None:
-            # in this case we know the value of begin, and since end_mask is True, we know that the slice
-            # is till the right most edge
-            if begin[idx] > 0 and stride[idx] < 0:
-                ret_shape.append(
-                    np.arange(begin[idx] + 1)[slice(begin[idx], None, stride[idx])].size
-                )
-                continue
-            if begin[idx] < 0 and stride[idx] > 0:
-                ret_shape.append(
-                    np.arange(abs(begin[idx]))[
-                        slice(begin[idx], None, stride[idx])
-                    ].size
-                )
+            if (begin[idx] == 0 and stride[idx] < 0) or (begin[idx] == -1 and stride[idx] > 0):
+                ret_shape.append(1)
                 continue
 
         # for symbolic case
@@ -571,3 +547,90 @@ def solve_slice_by_index_shape(x_shape, begin, end, stride, begin_mask, end_mask
         ret_shape.append(max(0, num))
 
     return ret_shape
+
+
+def pack_elements_into_bits(elements: np.ndarray, nbits: int) -> np.ndarray:
+    """
+    Pack elements into nbits representation, by starting with the least significant bit (LSB) and
+    moving upward to the most significant bit (MSB).
+
+    Returns packed elements as np.uint8.
+    """
+    if not np.issubdtype(elements.dtype, np.integer):
+        raise ValueError(f"Only support packing integers elements, but got {elements.dtype}")
+
+    # Adjust allowed value range based on if the input is signed or unsigned.
+    if np.issubdtype(elements.dtype, np.signedinteger):
+        max_val = 2 ** (nbits - 1) - 1
+        min_val = -max_val - 1
+    else:
+        max_val = 2**nbits - 1
+        min_val = 0
+    if np.max(elements) > max_val:
+        raise ValueError(
+            f"To pack elements into {nbits}-bit, the max value is {max_val}, but got {np.max(elements)}"
+        )
+    if np.min(elements) < min_val:
+        raise ValueError(
+            f"To pack elements into {nbits}-bit, the min value is {min_val}, but got {np.min(elements)}"
+        )
+
+    # As np.unpackbits only supports uint8, convert to uint8 first.
+    # Notice that it will not lose information, because the bits are unchanged when converting int8
+    # to uint8. For example, the signed int -6 has bit representation '11111010', and when we unpackbits
+    # we get [0, 1, 0, 1, 1, 1, 1, 1], where only first 4 elements are needed for 4-bit representation.
+    elements = elements.astype(np.uint8)
+    bitarray = np.unpackbits(elements.reshape(-1, 1), bitorder="little", axis=-1)[:, :nbits]
+    return np.packbits(bitarray.flatten(), bitorder="little")
+
+
+def restore_elements_from_packed_bits(
+    packed_values: np.ndarray, nbits: int, element_num: int, are_packed_values_signed: bool = False
+) -> np.ndarray:
+    """
+    Restore elements from packed bits. Requires values that are packed by starting with the
+    least significant bit (LSB) and moving upward to the most significant bit (MSB), which is the
+    method used in `pack_elements_into_bits`.
+
+    are_packed_values_signed: Indicates if the packed_values were packed from signed integers. If
+        True, the n-bit number unpacked from packed_values will be interpreted as signed integers,
+        and the returned ndarray will have dtype np.int8. Otherwise, np.uint8 will be used.
+    """
+    if len(packed_values.shape) != 1:
+        raise NotImplementedError(
+            f"Only support 1-rank packed_values. But got {len(packed_values.shape)}"
+        )
+
+    if packed_values.dtype == np.int8:
+        # As np.unpackbits only supports uint8, need to convert first.
+        packed_values = packed_values.astype(np.uint8)
+    elif packed_values.dtype != np.uint8:
+        raise NotImplementedError(
+            f"Only support int8 or uint8 packed_values, but got {packed_values.dtype}"
+        )
+
+    bitarray = np.unpackbits(packed_values, bitorder="little")
+    pad_required = bitarray.size % nbits != 0
+    if pad_required:
+        bitarray = np.concatenate([bitarray, np.zeros(nbits - bitarray.size % nbits)]).astype(
+            bitarray.dtype
+        )
+        if bitarray.size % nbits != 0:
+            raise ValueError(
+                f"The length of bitarray ({bitarray.size}) should be divisible by "
+                f"nbits ({nbits})."
+            )
+    bitarray = bitarray.reshape(-1, nbits)[:element_num, :]
+    # The np.packbits doesn't work well for signed int if we feed `bitarray` to it directly.
+    # For example, the original signed int is -6, which is packed as 1010 for 4-bit representation,
+    # and here `bitarray` is [[0, 1, 0, 1]], where the value will be interpreted as 10 (b'1010')
+    # by np.packbits.
+    # To make np.packbits work correctly, we need to repeat the sign bit. For example, 1010 will
+    # become 11111010, where np.packbits can correctly handle and after converting to int8 it's -6.
+    if are_packed_values_signed:
+        # Repeat the sign bit to make uint8 to int8 works.
+        bitarray = np.repeat(bitarray, [1] * (nbits - 1) + [8 - nbits + 1], axis=1)
+    restored_elements = np.packbits(bitarray, bitorder="little", axis=-1).reshape(-1)
+    if are_packed_values_signed:
+        restored_elements = restored_elements.astype(np.int8)
+    return restored_elements

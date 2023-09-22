@@ -144,6 +144,10 @@ NUM_TO_TORCH_DTYPE = {
     14: torch.qint32,
 }
 
+TORCH_DTYPE_TO_NUM = {
+    dtype: val for val, dtype in NUM_TO_TORCH_DTYPE.items()
+}
+
 NUMPY_DTYPE_TO_TORCH_NUM = {
     _np.uint8: 0,
     _np.int8: 1,
@@ -232,6 +236,35 @@ def _list_select(shape_var, index):
         res = mb.gather(x=shape_var, indices=index)
     return res
 
+def _is_const(var, optional=False):
+    """
+    Check if a var is a const.
+    It could be `const` or `constexpr_` ops.
+    """
+    if optional and var is None:
+        return True
+    if isinstance(var, np.ndarray):
+        return True
+    return var is not None and (var.val is not None or var.op.op_type.startswith("constexpr_"))
+
+def _create_linear_layer(x, w, bias):
+    """
+    Utility to translate linear layer.
+    Since the linear layer can only take `const` or `constexpr_` weight as input,
+    for other cases, we implement the linear layer through matmul.
+
+    For instance, given a torch model with an int8 weight:
+
+    int8_weight -> transpose -> reshape -> linear
+
+    If we directly use `mb.linear`, it is going to produce compilation error at the runtime.
+    """
+    if _is_const(w) and _is_const(bias, optional=True):
+        return mb.linear(x=x, weight=w, bias=bias)
+    res = mb.matmul(x=x, y=w, transpose_y=True)
+    if bias is not None:
+        res = mb.add(x=res, y=bias)
+    return res
 
 def _construct_constant(val, name):
     # Converter cannot handle torch tensors.
@@ -850,9 +883,10 @@ def linear(context, node):
     inputs = _get_inputs(context, node, expected=[2, 3])
     x = inputs[0]
     W = inputs[1]
+    x, W = promote_input_dtypes([x, W])
     bias = inputs[2] if len(node.inputs) == 3 else None
-    res = mb.linear(x=x, weight=W, bias=bias, name=node.name)
-    context.add(res)
+    res = _create_linear_layer(x, W, bias)
+    context.add(res, torch_name=node.name)
 
 
 @register_torch_op(torch_alias=["conv2d"])
@@ -1153,6 +1187,7 @@ def relu6(context, node):
 @register_torch_op
 def einsum(context, node):
     vars = context[node.inputs[1]]
+    vars = promote_input_dtypes(vars)
     equation = context[node.inputs[0]].val
     x = build_einsum_mil(vars, equation, node.name)
     context.add(x)
@@ -1570,7 +1605,6 @@ def view(context, node):
     if (
         isinstance(shape, list)
         and all([isinstance(dim, Var) and len(dim.shape) == 0 for dim in shape])
-        and any([dim.val is None for dim in shape])
     ):
         shape = mb.concat(values=shape, axis=0)
 
@@ -1581,7 +1615,7 @@ def view(context, node):
         view = mb.complex(real_data=real, imag_data=imag, name=node.name)
     else:
         view = mb.reshape(x=x, shape=shape, name=node.name)
-        
+
     context.add(view)
 
 
@@ -1856,7 +1890,7 @@ def group_norm(context, node):
         x = mb.mul(x=x,y=weight)
     if bias is not None:
         bias = mb.reshape(x=bias, shape=bias_shape)
-        x = mb.add(x=x,y=bias)
+        x = mb.add(x=x, y=bias)
     context.add(x,node.name)
 
 
@@ -3252,24 +3286,38 @@ def select(context, node):
     inputs = _get_inputs(context, node, expected=3)
     _input = inputs[0]
     dim = inputs[1].val
-    index = inputs[2].val
+    index = inputs[2]
 
     assert dim.shape == ()
-    assert index.shape == ()
 
     # NOTE:
     # Each index in @begin_array/@end_array corresponds to a dimension of @_input
     # Each val of those arrays corresponds to the start/end index to slice in that dimension
     rank = _input.rank
+
     begin_array = [0] * rank
-    begin_array[dim] = index
+    if index.val is None:
+        # index value not known till runtime
+        begin_array[dim] = index
+        begin_array = mb.concat(values=begin_array, axis=0)
+    else:
+        # index value known now
+        assert index.val.shape == ()
+        begin_array[dim] = index.val
+
     end_array = [s if isinstance(s, int) else 0 for s in _input.shape]
     end_mask = [True] * rank
     squeeze_mask = [False] * rank
     squeeze_mask[dim] = True
 
-    if index != -1:
-        end_array[dim] = index + 1
+    if index.val != -1:
+        if  index.val is None:
+            # index value not know till runtime
+            temp = mb.add(x=index, y=1)
+            end_array[dim] = temp
+            end_array = mb.concat(values=end_array, axis=0)
+        else:
+            end_array[dim] = index.val + 1
         end_mask[dim] = False
 
     slice_by_index = mb.slice_by_index(
@@ -3322,7 +3370,9 @@ def _get_slice_params(context, data, inputs):
     for i in range(num_of_slice_set):
         if inputs[3 * i + 1] is None:
             # This is pure index select
-            idx = context[inputs[3 * i]].val
+            idx = context[inputs[3 * i]]
+            if idx.val is not None:
+                idx = idx.val
             begin[i] = idx
             squeeze_mask[i] = True
         else:
@@ -3755,8 +3805,16 @@ def randint(context, node):
     context.add(rand_int)
 
 @register_torch_op
+def rand(context, node):
+    shape, _, dtype, _, _ = _get_inputs(context, node)
+    dtype = NUM_TO_DTYPE_STRING[TORCH_DTYPE_TO_NUM[dtype.val]] if dtype else "fp32"
+    low, high = mb.cast(x=0.0, dtype=dtype), mb.cast(x=1.0, dtype=dtype)
+    rand_uniform = mb.random_uniform(shape=shape, low=low, high=high)
+    context.add(rand_uniform, node.name)
+
+@register_torch_op
 def randn(context, node):
-    inputs = _get_inputs(context, node, expected=5)
+    inputs = _get_inputs(context, node, expected=[5, 6])
     shape = inputs[0]
     rand_normal = mb.random_normal(shape=shape)
     rand_fp32 = mb.cast(x=rand_normal, dtype="fp32", name=node.name)
@@ -3797,6 +3855,17 @@ def bitwise_and(context, node):
         raise NotImplementedError(
             f"The `bitwise_and` op only supports boolean input, but get {input_dtypes}."
         )
+
+
+@register_torch_op
+def logical_not(context, node):
+    # There is an optional `out` parameter in torch.logical_not.
+    inputs = _get_inputs(context, node, expected=[1, 2])
+    x = inputs[0]
+    if not types.is_bool(x.dtype):
+        x = mb.cast(x=x, dtype="bool")
+    res = mb.logical_not(x=x, name=node.name)
+    context.add(res)
 
 
 def _avg_pool(context, node, inputs):
@@ -3892,6 +3961,7 @@ def nll_loss(context, node):
 
     # compute the weights loss
     batch_size = x.shape[0]
+    class_num = x.shape[1]
 
     # only support weight and ignore_index both None
     if weight is not None:
@@ -3901,9 +3971,12 @@ def nll_loss(context, node):
 
     x = mb.cast(x=x, dtype="fp32")
     x = mb.mul(x=x, y=-1.)
-    range_indices = mb.range_1d(end=batch_size, start=0, step=1)
-    total_indices = mb.stack(values=[range_indices, target], axis=1)
-    loss = mb.gather_nd(x=x, indices=total_indices)
+
+    target = mb.cast(x=target, dtype="int32")
+    labels = mb.one_hot(indices=target, one_hot_vector_size=class_num)
+    labels = mb.cast(x=labels, dtype="fp32")
+    loss = mb.mul(x=x, y=labels)
+    loss = mb.reduce_sum(x=loss, axes=[1])
 
     # reduction type
     if reduction == "none":
@@ -4262,6 +4335,7 @@ def masked_fill(context, node):
     if value.dtype != x.dtype:
         value = mb.cast(x=value, dtype=builtin_to_string(x.dtype))
 
+    value, x = promote_input_dtypes([value, x])
     res = mb.select(cond=mask, a=value, b=x, name=node.name)
     context.add(res)
 
@@ -4327,13 +4401,14 @@ def meshgrid(context, node):
 # Defines all the nodes that are noOps
 @register_torch_op(
     torch_alias=[
+        "clone",
+        "contiguous",
+        "detach",
+        "device",
         "dropout",
         "dropout_",
         "feature_dropout",
-        "contiguous",
-        "device",
-        "detach",
-        "clone",
+        "lift_fresh",
     ]
 )
 def noop(context, node):
@@ -4579,6 +4654,69 @@ def repeat(context, node):
     if reps.shape[0] > len(x.shape):
         x = mb.expand_dims(x=x, axes=list(range(reps.shape[0] - x.rank)))
     context.add(mb.tile(x=x, reps=reps, name=node.name))
+
+
+@register_torch_op
+def repeat_interleave(context, node):
+    """
+    For now, we only support scalar repeats + None or 0 dim
+    """
+    x, repeats, dim, _ = _get_inputs(context, node, expected=4)
+
+    repeats_val = repeats.val
+    if isinstance(repeats_val, np.ndarray):
+        repeats_val0 = np.expand_dims(repeats_val, 0).reshape(-1)[0]
+        if np.any(repeats_val != repeats_val0):
+            raise NotImplementedError(
+                "Conversion for torch.repeat_interleave with Tensor repeats has not been implemented"
+            )
+        repeats_val = repeats_val0
+
+    # This would operate on the flattened input tensor
+    if dim is None:
+        x = mb.reshape(x=x, shape=(-1,))
+    else:
+        if dim.val != 0:
+            raise NotImplementedError(
+                "Conversion for torch.repeat_interleave with non-zero dim has not been implemented"
+            )
+
+    """
+    on a high level:
+         x
+         | tile in dim 0
+         v
+        [x, x, ...]
+         | reshape to split the repeats
+         v
+        [[x],
+         [x],
+         ...]
+         | transpose(1, 0)
+         V
+        [x^T, x^T, ...]
+         | flatten
+         V
+        result
+    """
+
+    reps = [1] * x.rank
+    reps[0] = repeats_val
+    x_tiled = mb.tile(x=x, reps=reps)
+
+    split_reps = [repeats_val] + list(x.shape)
+    x_reshaped = mb.reshape(x=x_tiled, shape=list(split_reps))
+
+    perm = [*range(x.rank + 1)]
+    perm[0] = 1
+    perm[1] = 0
+    x_transposed = mb.transpose(x=x_reshaped, perm=perm)
+
+    result_shape = list(x.shape)
+    result_shape[0] = -1
+    result = mb.reshape(x=x_transposed, shape=result_shape, name=node.name)
+
+    context.add(result)
 
 
 @register_torch_op
@@ -5467,7 +5605,7 @@ def baddbmm(context, node):
             context.add(bias)
 
         baddbmm_node = mb.add(x=bias, y=bmm_node, name=node.name)
-        context.add(baddbmm_node)    
+        context.add(baddbmm_node)
     else:
         bmm_node.name = node.name
         context.add(bmm_node)
@@ -5638,6 +5776,36 @@ def roll(context, node):
     context.add(x, node.name)
 
 
+def _construct_unfold_indices(N, C, H, W, kernel_size, stride):
+    """
+    A utility function to construct indices for torch.unfold (im2col),
+    assuming the torch.unfold input `x` to be contiguous
+    """
+
+    # Get starting block indices.
+    start_idx = _np.arange(kernel_size[0])[None, :, None] * W + _np.arange(
+        kernel_size[1]
+    )
+
+    # Generate depth indices.
+    channel_index = H * W * _np.arange(C)
+    start_idx = (channel_index[None, :, None] + _np.ravel(start_idx)).reshape(
+        (-1, kernel_size[0], kernel_size[1])
+    )
+
+    # Get offsetted indices across the height and width of input array.
+    row_extent = H - kernel_size[0] + 1
+    col_extent = W - kernel_size[1] + 1
+    offset_idx = _np.arange(0, row_extent, stride[0])[None, :, None] * W + _np.arange(0, col_extent, stride[1])
+    indices = _np.ravel(start_idx)[:, None] + _np.ravel(offset_idx)
+
+    # Get batch block indices.
+    batch_idx = _np.arange(N)[:, None, None] * C * H * W
+    indices = batch_idx + indices
+
+    return indices.reshape(-1)
+
+
 @register_torch_op
 def im2col(context, node):
     """
@@ -5689,50 +5857,100 @@ def im2col(context, node):
     sptial_size = (H, W)
     block_count = 1
     for i in range(2):
-        block_count *= (
-            _np.floor(
-                # the original formula is
-                #     (sptial_size[i] + 2 * padding[i] - dilation[i] * (kernel_size[i] - 1) - 1) / stride[i]
-                # since we have explicitly padded, we no longer add 2 * padding[i] to sptial_size[i]
-                (sptial_size[i] - dilation[i] * (kernel_size[i] - 1) - 1) / stride[i]
-            ).astype(_np.int32)
+        block_count *= _np.floor(
+            # the original formula is
+            #     (sptial_size[i] + 2 * padding[i] - dilation[i] * (kernel_size[i] - 1) - 1) / stride[i]
+            # since we have explicitly padded, we no longer add 2 * padding[i] to sptial_size[i]
+            (sptial_size[i] - dilation[i] * (kernel_size[i] - 1) - 1) / stride[i]
             + 1
-        )
+        ).astype(_np.int32)
 
     """
     The implementation below assumes x to be contiguous
     """
 
-    # Get batch block indices.
-    batch_idx = _np.arange(N)[:, None, None] * C * H * W
+    indices = _construct_unfold_indices(N, C, H, W, kernel_size, stride)
 
-    # Get starting block indices.
-    start_idx = _np.arange(kernel_size[0])[None, :, None] * W + _np.arange(
-        kernel_size[1]
-    )
-
-    # Generate depth indices.
-    channel_index = H * W * _np.arange(C)
-    start_idx = (channel_index[None, :, None] + _np.ravel(start_idx)).reshape(
-        (-1, kernel_size[0], kernel_size[1])
-    )
-
-    # Get offsetted indices across the height and width of input array.
-    row_extent = H - kernel_size[0] + 1
-    col_extent = W - kernel_size[1] + 1
-    offset_idx = _np.arange(0, row_extent, stride[0])[None, :, None] * W + _np.arange(0, col_extent, stride[1])
-    indices = _np.ravel(start_idx)[:, None] + _np.ravel(offset_idx)
-
-    # Gather batches together.
-    indices = batch_idx + indices
     x = mb.reshape(x=x, shape=[-1])
-    gathered_data = mb.gather_along_axis(x=x, indices=indices.reshape(-1), axis=0)
+    gathered_data = mb.gather_along_axis(x=x, indices=indices, axis=0)
     block_size = C * kernel_size[0] * kernel_size[1]
     output = mb.reshape(
         x=gathered_data, shape=(N, block_size, block_count), name=node.name
     )
 
     context.add(output)
+
+
+@register_torch_op
+def col2im(context, node):
+    """
+    Combines an array of sliding local blocks into a large containing tensor.
+
+    torch.nn.functional.fold aims to be the general version:
+    col2im is the "2 output spatial dimensions" case of fold.
+
+    PyTorch currently only supports col2im: torch.nn.functional.fold redispatches to at::col2im,
+    which is why coremltools needs col2im to convert torch.nn.functional.fold.
+
+    We currently only support col2im (consistent with PyTorch) and:
+    * dilation set to 1
+    * padding set to 0
+    * stride set to kernel_size
+    * output_size is divisible by kernel_size
+
+    More flexbible support will be added in the future.
+
+    Reference https://pytorch.org/docs/stable/generated/torch.nn.Fold.html
+    """
+
+    inputs = _get_inputs(context, node, expected=6)
+    x = inputs[0]
+    output_size = inputs[1].val
+    kernel_size = inputs[2].val
+    dilation = inputs[3].val
+    padding = inputs[4].val
+    stride = inputs[5].val
+
+    if len(output_size) != 2:
+        raise ValueError("Only supports 2 output spatial dimensions for col2im (fold).")
+    if not (dilation[0] == 1 and dilation[1] == 1):
+        raise ValueError("Only supports dilation=1 for col2im (fold).")
+    if not (padding[0] == 0 and padding[1] == 0):
+        raise ValueError("Only supports padding=0 for col2im (fold).")
+    # In Pytorch, if multiple entries unfold to same location, then in folding they are accumulated
+    # In Core ML, however, there is no such op to perform this accumulation,
+    # so we cowardly refuse to convert if accumulation happens
+    # TODO: we may be able to support accumulation if x has certain symmetry (e.g. output by im2col)
+    #       by multiplying the repeat times of each entry
+    if any(stride != kernel_size):
+        raise ValueError("Only supports stride = kernel_size for col2im (fold).")
+    # We implement fold as an inverse to unfold
+    # i.e. a gather with indices that are inverse to unfold gather indices
+    # This works only if there is no edge leftover
+    if any(output_size % kernel_size != 0):
+        raise ValueError("Only supports output_size % kernel_size = 0 for col2im (fold).")
+
+    N, block_size, block_count = x.shape
+    C = int(block_size / _np.prod(kernel_size))
+    H, W = output_size
+
+    """
+    The implementation below assumes x to be contiguous
+    """
+
+    # inverse unfold indices
+    indices_unfold = _construct_unfold_indices(N, C, H, W, kernel_size, stride)
+    indices = _np.empty(indices_unfold.shape, dtype=np.int32)
+    for i in range(indices.shape[0]):
+        indices[indices_unfold[i]] = i
+
+    # perform gather with fold indices
+    x_flatten = mb.reshape(x=x, shape=(-1,))
+    y_flatten_with_extra = mb.gather_along_axis(x=x_flatten, indices=indices)
+    y_flatten = mb.slice_by_index(x=y_flatten_with_extra, begin=(0,), end=(N * C * H * W,))
+    y = mb.reshape(x=y_flatten, shape=(N, C, H, W), name=node.name)
+
+    context.add(y)
 
 
 @register_torch_op
@@ -5760,6 +5978,18 @@ def imag(context, node):
         raise ValueError("The `imag` op only supports complex input.")
     real_part = mb.complex_imag(data=input_data)
     context.add(real_part, node.name)
+
+
+@register_torch_op
+def view_as_real(context, node):
+    input_data = _get_inputs(context, node, expected=1)[0]
+    if not types.is_complex(input_data.dtype):
+        raise ValueError(f"view_as_real only supports complex input, but got {types.builtin_to_string(input_data.dtype)}")
+
+    real_part = mb.complex_real(data=input_data)
+    imag_part = mb.complex_imag(data=input_data)
+    result = mb.stack(values=[real_part, imag_part], axis=-1)
+    context.add(result, node.name)
 
 
 @register_torch_op
@@ -5834,12 +6064,12 @@ def stft(context, node):
     if types.is_complex(input_data.dtype):
         onesided = False # pytorch defaults onesided to False for complex inputs
     stft_res = mb.complex_stft(
-        input=input_data, 
-        n_fft=n_fft, 
-        hop_length=hop_length, 
-        win_length=win_length, 
-        window=window, 
-        normalized=normalized, 
+        input=input_data,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        normalized=normalized,
         onesided=onesided)
     context.add(stft_res, node.name)
 
@@ -6031,4 +6261,18 @@ def scaled_dot_product_attention(context, node):
 
     # multiply attn_weights and value tensor
     res = mb.matmul(x=attn_weights_normalized, y=v, name=node.name)
+    context.add(res)
+
+
+@register_torch_op
+def fliplr(context, node):
+    """
+    Flip tensor in the left/right direction.
+
+    Flip the entries in each row in the left/right direction. Columns are preserved, but appear in a
+    different order than before.
+    It's equivalent to TF's reverse op but with axes always be [1].
+    """
+    x = _get_inputs(context, node, expected=1)[0]
+    res = mb.reverse(x=x, axes=[1], name=node.name)
     context.add(res)

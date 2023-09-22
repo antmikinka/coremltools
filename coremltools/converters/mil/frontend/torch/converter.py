@@ -11,7 +11,7 @@ import torch as torch
 from coremltools import _logger as logger
 from coremltools._deps import version_lt
 from coremltools.converters.mil._deployment_compatibility import AvailableTarget as _target
-from coremltools.converters.mil.input_types import ImageType
+from coremltools.converters.mil.input_types import ImageType, TensorType
 from coremltools.converters.mil.mil import Builder as mb
 from coremltools.converters.mil.mil import Function, Program, types
 from coremltools.converters.mil.mil.types import is_float
@@ -19,6 +19,7 @@ from coremltools.converters.mil.mil.types import is_float
 from .._utils import get_output_names
 from .internal_graph import InternalTorchIRGraph, InternalTorchIRNode
 from .ops import convert_nodes
+from .quantization_ops import _dequantized_weight
 from .torch_op_registry import _TORCH_OPS_REGISTRY
 from .torchir_passes import (
     flatten_graph_input_values,
@@ -147,8 +148,6 @@ class QuantizationContext:
             # the MIL op.
             if dequantized_name is not None:
                 self._context.add(original_var, dequantized_name)
-            if self._quant_dtype is None:
-                raise AssertionError("Trying to dequantize without quantization info")
             return original_var, self._quant_dtype
 
         quant_params = self.get_quantization_info(name)
@@ -292,6 +291,7 @@ class TorchConverter:
         outputs=None,
         cut_at_symbols=None,
         opset_version=None,
+        use_default_fp16_io=False,
     ):
         """
         Arguments:
@@ -302,6 +302,10 @@ class TorchConverter:
                 terminate once these symbols have been generated. For debugging use
                 only. See kwarg in load.py.
             opset_version: An int represents the Core ML opset version.
+            use_default_fp16_io (optional): bool. Defaults to False.
+                When minimum_deployment_target set >= ct.target.iOS16 (the same as ct.target.macOS13),
+                and the compute precision set to fp16, this flag is True.
+                When True, fp32 i/o defaults to fp16.
         """
         assert isinstance(torchscript, torch.jit.ScriptModule)
 
@@ -312,6 +316,13 @@ class TorchConverter:
 
         self.torchscript = torchscript
         self.outputs = outputs
+        self.use_default_fp16_io = use_default_fp16_io
+
+        if self.use_default_fp16_io:
+            # If the input type is not specified by the user and use_default_fp16_io
+            # is True. Make the default input type to fp16
+            self._adjust_default_input_to_fp16()
+
         self.output_names = get_output_names(self.outputs)
         self.opset_version = _target(opset_version) if opset_version is not None else None
         self.context = TranscriptionContext()
@@ -336,6 +347,37 @@ class TorchConverter:
 
         self.inputs = list(self.graph.inputs.values())
         self._prog = Program()
+
+    def _adjust_default_input_to_fp16(self):
+        """
+        An utility function that sets the default input dtype to fp16
+        """
+        assert isinstance(self.inputs, list), "inputs must be type of list"
+        # Adjust inputs dtype to fp16
+        for val in self.inputs:
+            if isinstance(val, TensorType) and val.dtype is None:
+                val.dtype = types.fp16
+
+    def _adjust_default_output_to_fp16(self, graph_outputs):
+        """
+        An utility function that sets the default outputs with inferred type fp32 to fp16.
+
+        - If the inferred output dtype is fp32, and the user doesn't provide dtype, it defaults to fp16.
+        - If the inferred output dtype is not fp32, nothing would change.
+        """
+        if self.outputs is None:
+            self.outputs = []
+            for val in graph_outputs:
+                dtype = types.fp16 if val.dtype == types.fp32 else val.dtype
+                self.outputs.append(TensorType(dtype=dtype))
+        else:
+            for i, val in enumerate(self.outputs):
+                if (
+                    isinstance(val, TensorType)
+                    and val.dtype is None
+                    and graph_outputs[i].dtype == types.fp32
+                ):
+                    val.dtype = types.fp16
 
     @staticmethod
     def _check_ops(graph):
@@ -367,6 +409,11 @@ class TorchConverter:
         """
         shape = _input.shape.symbolic_shape
         dtype = _input.dtype
+        # int64 and fp64 are not supported, so they are mapped to int32 / fp32 accordingly
+        if dtype == types.int64:
+            dtype = types.int32
+        elif dtype == types.fp64:
+            dtype = types.fp32
         return mb.placeholder(shape, dtype=dtype)
 
     def check_ops(self):
@@ -380,6 +427,10 @@ class TorchConverter:
         for name, val in self.graph.params.items():
             if isinstance(val, torch._C.ScriptObject):
                 logger.info(f"Encountered constant {name} of type _torch._C.ScriptObject")
+                continue
+            elif isinstance(val, torch.Tensor) and val.is_quantized:
+                const = _dequantized_weight(val.cpu(), name)
+                self.context.add(const)
                 continue
             elif not isinstance(val, np.ndarray):
                 raise ValueError(f"unsupported class for {name} in PyTorch graph: {type(val)}")
@@ -421,15 +472,9 @@ class TorchConverter:
                 self.graph.inputs.keys(), ssa_func_inputs.keys()
             ):
                 input_var = ssa_func.inputs[users_name]
-                if (types.is_tensor(input_var.sym_type) or types.is_scalar(input_var.sym_type)) \
-                    and (input_var.dtype == types.fp16 or input_var.dtype == types.fp64):
-                    # cast the input var to float32
-                    # We need to do this because the type inference is very buggy when started from
-                    # float16/float64 typed inputs. Until that is fixed in the following radar
-                    # we cast all inputs of type float16/float64 to float32 as the first step.
-                    # These casts will later get removed, if compute_precision=Float16 is
-                    # provided, which will cause the FP16ComputePrecision pass to run.
-                    # TODO: remove this when this radar is fixed: rdar://93731970
+                if (
+                    types.is_tensor(input_var.sym_type) or types.is_scalar(input_var.sym_type)
+                ) and input_var.dtype == types.fp16:
                     input_var = mb.cast(x=input_var, dtype="fp32")
                 self.context.add(input_var, torch_name=internal_name)
 
@@ -461,6 +506,10 @@ class TorchConverter:
 
             ssa_func.set_outputs(graph_outputs)
             prog.add_function("main", ssa_func)
+            if self.use_default_fp16_io:
+                # If the output type is not specified by the user and use_default_fp16_io
+                # is True. Make the default output type to fp16
+                self._adjust_default_output_to_fp16(graph_outputs)
             if self.outputs is not None:
                 prog.set_main_output_types(self.outputs)
         return prog
@@ -577,10 +626,10 @@ class TorchConverter:
                 if is_tensor or is_quantized_tensor:
                     if is_tensor and prefix in state_dict:
                         assert torch.equal(
-                            module, state_dict[prefix]
+                            module.cpu(), state_dict[prefix].cpu()
                         ), "tensor value not consistent between torch ir and state_dict"
                     if prefix in params_dict:
-                        assert torch.equal(module, params_dict[prefix])
+                        assert torch.equal(module.cpu(), params_dict[prefix].cpu())
                         replace_input[_output] = first_node_with_prefix[prefix]
                     else:
                         params_dict[prefix] = module

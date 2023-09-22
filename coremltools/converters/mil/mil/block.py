@@ -356,13 +356,11 @@ class Block:
             if not isinstance(v, (Var, tuple)):
                 continue
             vs = [v] if isinstance(v, Var) else v
-            for s in vs:
-                if not self.is_var_visible_in_block(s, upto_op_with_id=idx):
+            for v in vs:
+                if not self.is_var_visible_in_block(v, upto_op_with_id=idx):
                     before_op_name = before_op.name if before_op is not None else "None"
                     msg = "Op '{}' input {}={} is not in scope of {} before {}"
-                    raise ValueError(
-                        msg.format(new_op.name, k, s.name, self.name, before_op_name)
-                    )
+                    raise ValueError(msg.format(new_op.name, k, v.name, self.name, before_op_name))
 
         # add new_op
         if before_op is None:
@@ -445,6 +443,8 @@ class Block:
             old_var.consuming_blocks.remove(self)
             # Ensure output name is consistent
             if isinstance(self, Function):
+                if new_var in self.inputs.values() and new_var.name != old_var.name:
+                    raise ValueError("It is not allowed to modify function inputs name.")
                 new_var.name = old_var.name
 
     def try_replace_uses_of_var_after_op(

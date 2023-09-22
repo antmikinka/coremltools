@@ -3,7 +3,7 @@
 #  Use of this source code is governed by a BSD-3-clause license that can be
 #  found in the LICENSE.txt file or at https://opensource.org/licenses/BSD-3-Clause
 
-from typing import Optional
+from typing import Optional, Union
 
 from coremltools.converters.mil.mil import types
 from coremltools.converters.mil.mil.types import builtin_to_string
@@ -86,6 +86,7 @@ class Var:
         "_child_ops",
         "consuming_blocks",
         "_nonreplaceable_vars_upstream",
+        "is_descendant_of_const",
     ]
 
     def __init__(
@@ -120,6 +121,17 @@ class Var:
         self._nonreplaceable_vars_upstream = set()
         self._set_nonreplaceable_vars_upstream()
 
+        self._adjust_sym_val()
+
+        # Track vars constness, which requires a var to satisfy one of the following:
+        # 1. var.val is not None, whichs mean the converter already has its compile time value through value inference.
+        # 2. Is a descendant of ``constexpr_`` ops. We don't compute the value inference of those ``constexpr_`` ops,
+        #    due to the fact it can potentially results in memory issue.
+        self.is_descendant_of_const = Var._propagate_constness_upstream(self)
+
+    def _adjust_sym_val(self):
+        pass
+
     @property
     def nonreplaceable_vars_upstream(self):
         return self._nonreplaceable_vars_upstream
@@ -135,6 +147,16 @@ class Var:
         if op is None:
             return False
         return op.op_type.startswith("constexpr_")
+
+    @staticmethod
+    def _propagate_constness_upstream(var):
+        op = var.op
+        if op is None:
+            return False
+        if op.op_type.startswith("constexpr_") or var.val is not None:
+            return True
+        flattened_inputs = op.get_flattened_inputs()
+        return all([x.is_descendant_of_const for x in flattened_inputs])
 
     def _set_nonreplaceable_vars_upstream(self):
         """
@@ -253,7 +275,9 @@ class Var:
     def set_name(self, name):
         self.name = name
 
-    def is_tensor_or_scalar_of(self, dtype: str):
+    def is_tensor_or_scalar_of(self, dtype: Union[str, type]):
+        if isinstance(dtype, type):
+            dtype = builtin_to_string(dtype)
         return (types.is_tensor(self.sym_type) or types.is_scalar(self.sym_type)) and builtin_to_string(self.dtype) == dtype
 
     def __str__(self):
